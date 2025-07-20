@@ -294,6 +294,30 @@ def create_app():
         finally:
             cursor.close()
     
+    @app.route('/api/users', methods=['GET'])
+    @login_required
+    def get_all_users():
+        """
+        Возвращает список всех активных пользователей.
+        Доступно только для аутентифицированных пользователей.
+        """
+        db = get_db()
+        cursor = db.cursor()
+        try:
+            # Ищем всех пользователей, исключая удаленных
+            cursor.execute(
+                "SELECT id, username, display_name, avatar_url FROM users WHERE is_deleted = FALSE"
+            )
+            users = cursor.fetchall()
+            # Преобразуем Row-объекты в словари для jsonify
+            users_list = [dict(user) for user in users]
+            return jsonify(users_list), 200 # Возвращаем список пользователей
+        except Exception as e:
+            print(f"Ошибка при получении списка пользователей: {e}")
+            return jsonify({'error': 'Внутренняя ошибка сервера'}), 500
+        finally:
+            cursor.close()
+    
     # API для Управления Чатами
 
     # Вспомогательная функция для создания чата (используется внутренне)
@@ -402,24 +426,83 @@ def create_app():
     # Специфические маршруты для создания чатов
     @app.route('/api/chats/private', methods=['POST'])
     @login_required
-    def create_private_chat_api():
+    def create_private_chat():
         user_id = g.user['id']
-        data = request.get_json()
-        target_username = data.get('target_username')
-
-        if not target_username:
-            return jsonify({'error': 'Требуется имя пользователя для личного чата.'}), 400
         
+        # ДОБАВЛЕННЫЕ ОТЛАДОЧНЫЕ ВЫВОДЫ
+        print(f"DEBUG: Incoming JSON for private chat: {request.json}")
+        username = request.json.get('username')
+        print(f"DEBUG: Extracted username for private chat: {username}")
+        # КОНЕЦ ДОБАВЛЕННЫХ ОТЛАДОЧНЫХ ВЫВОДОВ
+
+        if not username:
+            return jsonify({'error': 'Требуется имя пользователя для личного чата.'}), 400
+
         db = get_db()
         cursor = db.cursor()
+
         try:
-            cursor.execute("SELECT id FROM users WHERE username = ? AND is_deleted = FALSE", (target_username,))
-            target_user = cursor.fetchone()
-            if not target_user:
-                return jsonify({'error': 'Пользователь не найден или удален.'}), 404
+            # Находим ID второго пользователя по его username
+            cursor.execute("SELECT id FROM users WHERE username = ?", (username,))
+            other_user = cursor.fetchone()
+
+            if not other_user:
+                return jsonify({'error': 'Пользователь не найден.'}), 404
+
+            other_user_id = other_user['id']
+
+            # Проверяем, не пытается ли пользователь создать чат с самим собой
+            if user_id == other_user_id:
+                return jsonify({'error': 'Невозможно создать приватный чат с самим собой.'}), 400
+
+            # Проверяем, существует ли уже приватный чат между этими двумя пользователями
+            # Важно: порядок user1_id и user2_id не имеет значения
+            cursor.execute("""
+                SELECT pc.chat_id FROM private_chats pc
+                JOIN chats c ON pc.chat_id = c.id
+                WHERE (pc.user1_id = ? AND pc.user2_id = ?) OR
+                      (pc.user1_id = ? AND pc.user2_id = ?)
+            """, (user_id, other_user_id, other_user_id, user_id))
+            existing_chat = cursor.fetchone()
+
+            if existing_chat:
+                return jsonify({'error': 'Приватный чат с этим пользователем уже существует.', 'chat_id': existing_chat['chat_id']}), 409 # 409 Conflict
+
+            # Создаем новую запись в таблице chats
+            cursor.execute(
+                "INSERT INTO chats (type) VALUES (?)",
+                ('private',)
+            )
+            chat_id = cursor.lastrowid
+
+            # Создаем новую запись в таблице private_chats
+            cursor.execute(
+                "INSERT INTO private_chats (chat_id, user1_id, user2_id) VALUES (?, ?, ?)",
+                (chat_id, user_id, other_user_id) # <-- user1_id заменен на user_id
+            )
+            db.commit()
             
-            member_ids = [target_user['id']]
-            return _create_chat_logic(user_id, 'private', member_ids=member_ids)
+            # Обновляем имя приватного чата
+            # Здесь можно было бы установить имя на стороне клиента, но для согласованности с серверным подходом
+            # установим его здесь, используя display_name пользователей
+            
+            # Получаем display_name текущего пользователя
+            cursor.execute("SELECT display_name FROM users WHERE id = ?", (user_id,))
+            current_user_display_name = cursor.fetchone()['display_name']
+
+            # Получаем display_name другого пользователя
+            cursor.execute("SELECT display_name FROM users WHERE id = ?", (other_user_id,))
+            other_user_display_name = cursor.fetchone()['display_name']
+
+            chat_name = f"{current_user_display_name} и {other_user_display_name}"
+            cursor.execute("UPDATE chats SET name = ? WHERE id = ?", (chat_name, chat_id))
+            db.commit()
+
+            return jsonify({'message': 'Приватный чат создан успешно.', 'chat_id': chat_id, 'chat_name': chat_name}), 201
+        except Exception as e:
+            db.rollback()
+            print(f"Ошибка при создании приватного чата: {e}")
+            return jsonify({'error': 'Внутренняя ошибка сервера'}), 500
         finally:
             cursor.close()
 
@@ -780,7 +863,139 @@ def create_app():
         finally:
             cursor.close()
 
+    @app.route('/api/chats/<int:chat_id>/leave', methods=['POST'])
+    @login_required
+    def leave_chat(chat_id):
+        user_id = g.user['id']
+        db = get_db()
+        cursor = db.cursor()
+        try:
+            # Получаем тип чата
+            cursor.execute("SELECT type, owner_id FROM chats WHERE id = ?", (chat_id,))
+            chat_info = cursor.fetchone()
+
+            if not chat_info:
+                return jsonify({'error': 'Чат не найден.'}), 404
+            
+            chat_type = chat_info['type']
+            owner_id = chat_info['owner_id']
+
+            if chat_type == 'private':
+                return jsonify({'error': 'Нельзя "покинуть" приватный чат. Для этого удалите его.'}), 400
+            elif chat_type == 'group':
+                # Проверить, является ли пользователь участником группы
+                cursor.execute(
+                    "SELECT id FROM group_members WHERE group_id = ? AND user_id = ?",
+                    (chat_id, user_id)
+                )
+                if not cursor.fetchone():
+                    return jsonify({'error': 'Вы не являетесь участником этого группового чата.'}), 403
+                
+                cursor.execute(
+                    "DELETE FROM group_members WHERE group_id = ? AND user_id = ?",
+                    (chat_id, user_id)
+                )
+                db.commit()
+                return jsonify({'message': 'Вы успешно покинули групповой чат.'}), 200
+            elif chat_type == 'channel':
+                # Владелец канала не может его "покинуть", он может только удалить его
+                if owner_id == user_id:
+                    return jsonify({'error': 'Владелец канала не может его покинуть. Удалите канал, если он больше не нужен.'}), 400
+
+                # Проверить, является ли пользователь подписчиком канала
+                cursor.execute(
+                    "SELECT id FROM channel_subscribers WHERE channel_id = ? AND user_id = ?",
+                    (chat_id, user_id)
+                )
+                if not cursor.fetchone():
+                    return jsonify({'error': 'Вы не являетесь подписчиком этого канала.'}), 403
+                
+                cursor.execute(
+                    "DELETE FROM channel_subscribers WHERE channel_id = ? AND user_id = ?",
+                    (chat_id, user_id)
+                )
+                db.commit()
+                return jsonify({'message': 'Вы успешно отписались от канала.'}), 200
+            else:
+                return jsonify({'error': 'Неизвестный тип чата.'}), 400
+        except Exception as e:
+            db.rollback()
+            print(f"Ошибка при выходе из чата: {e}")
+            return jsonify({'error': 'Внутренняя ошибка сервера'}), 500
+        finally:
+            cursor.close()
+
     # API для управления участниками групп и каналов
+
+    @app.route('/api/chats/<int:chat_id>', methods=['DELETE'])
+    @login_required
+    def delete_chat_full(chat_id):
+        user_id = g.user['id']
+        db = get_db()
+        cursor = db.cursor()
+        try:
+            # Получаем информацию о чате: тип и владельца
+            cursor.execute("SELECT type, owner_id FROM chats WHERE id = ?", (chat_id,))
+            chat_info = cursor.fetchone()
+
+            if not chat_info:
+                return jsonify({'error': 'Чат не найден.'}), 404
+            
+            chat_type = chat_info['type']
+            owner_id = chat_info['owner_id']
+
+            can_delete = False
+
+            if chat_type == 'channel':
+                # Только владелец может удалить канал
+                if owner_id == user_id:
+                    can_delete = True
+                else:
+                    return jsonify({'error': 'Только владелец может удалить канал.'}), 403
+            elif chat_type == 'group':
+                # Для групповых чатов, удалять может только создатель (владелец, если такой концепт есть) или админ
+                # Здесь предполагаем, что создатель группы - это тот, кто ее создал, и он же может ее удалить.
+                # Если у вас есть роль 'admin' в group_members, то можно проверять и ее.
+                cursor.execute(
+                    "SELECT role FROM group_members WHERE group_id = ? AND user_id = ?",
+                    (chat_id, user_id)
+                )
+                member_role = cursor.fetchone()
+                if member_role and member_role['role'] == 'admin': # Или 'owner' если есть такая роль
+                    can_delete = True
+                else:
+                    return jsonify({'error': 'Только администратор группы может удалить ее.'}), 403
+            elif chat_type == 'private':
+                # Для приватного чата, оба участника могут "удалить" его для себя
+                # Но на самом деле, это будет помечено как удаленный для пользователя.
+                # Полное удаление приватного чата (удаление записи из chats)
+                # возможно, только если оба пользователя его "удалили".
+                # Для простоты, пока разрешим удаление, если пользователь является участником.
+                cursor.execute(
+                    "SELECT id FROM private_chats WHERE chat_id = ? AND (user1_id = ? OR user2_id = ?)",
+                    (chat_id, user_id, user_id)
+                )
+                if cursor.fetchone():
+                    can_delete = True
+                else:
+                    return jsonify({'error': 'Вы не являетесь участником этого приватного чата.'}), 403
+            else:
+                return jsonify({'error': 'Неизвестный тип чата.'}), 400
+
+            if not can_delete:
+                return jsonify({'error': 'У вас нет прав на удаление этого чата.'}), 403
+
+            # Удаляем чат. Благодаря ON DELETE CASCADE, все связанные записи (участники, сообщения) будут удалены.
+            cursor.execute("DELETE FROM chats WHERE id = ?", (chat_id,))
+            db.commit()
+            return jsonify({'message': f'Чат (ID: {chat_id}) успешно удален.'}), 200
+        except Exception as e:
+            db.rollback()
+            print(f"Ошибка при удалении чата: {e}")
+            return jsonify({'error': 'Внутренняя ошибка сервера'}), 500
+        finally:
+            cursor.close()
+
     @app.route('/api/groups/<int:group_id>/members', methods=['POST'])
     @login_required
     def add_group_member(group_id):
@@ -1374,4 +1589,12 @@ def create_app():
 
 if __name__ == '__main__':
     app = create_app()
+    # ДОБАВЛЕННЫЙ ОТЛАДОЧНЫЙ ВЫВОД: Перечисляем все зарегистрированные маршруты Flask
+    with app.test_request_context():
+        print("DEBUG: All registered Flask routes:")
+        for rule in app.url_map.iter_rules():
+            # Преобразуем методы в список для удобства чтения
+            methods = ', '.join(sorted(rule.methods - set(['HEAD', 'OPTIONS'])))
+            print(f"  Rule: {rule.endpoint}, Methods: [{methods}], Path: {rule.rule}")
+    # КОНЕЦ ДОБАВЛЕННОГО ОТЛАДОЧНОГО ВЫВОДА
     app.run(host='0.0.0.0', debug=True, port=5125)
